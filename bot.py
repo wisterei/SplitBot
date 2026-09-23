@@ -128,6 +128,88 @@ SET created_by = from_user
 WHERE created_by IS NULL
 """)
 
+
+def ensure_local_numbers(table_name: str):
+
+    cursor.execute(
+        f"PRAGMA table_info({table_name})"
+    )
+
+    columns = [
+        row[1]
+        for row in cursor.fetchall()
+    ]
+
+    # Добавляем колонку, если её ещё нет
+    if "local_number" not in columns:
+
+        cursor.execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD COLUMN local_number INTEGER
+            """
+        )
+
+    # Получаем все группы, в которых
+    # ещё есть записи без локального номера
+    cursor.execute(
+        f"""
+        SELECT DISTINCT chat_id
+        FROM {table_name}
+        WHERE local_number IS NULL
+        """
+    )
+
+    chats = cursor.fetchall()
+
+    for (chat_id,) in chats:
+
+        # Узнаём последний уже существующий номер
+        cursor.execute(
+            f"""
+            SELECT COALESCE(MAX(local_number), 0)
+            FROM {table_name}
+            WHERE chat_id = ?
+            """,
+            (chat_id,)
+        )
+
+        current_number = cursor.fetchone()[0]
+
+        # Старые записи нумеруем по порядку ID
+        cursor.execute(
+            f"""
+            SELECT id
+            FROM {table_name}
+            WHERE chat_id = ?
+            AND local_number IS NULL
+            ORDER BY id
+            """,
+            (chat_id,)
+        )
+
+        rows = cursor.fetchall()
+
+        for (row_id,) in rows:
+
+            current_number += 1
+
+            cursor.execute(
+                f"""
+                UPDATE {table_name}
+                SET local_number = ?
+                WHERE id = ?
+                """,
+                (
+                    current_number,
+                    row_id
+                )
+            )
+
+
+ensure_local_numbers("expenses")
+ensure_local_numbers("settlements")
+
 db.commit()
 
 
@@ -157,6 +239,17 @@ def format_money(kopecks: int) -> str:
         return f"{int(rubles)} ₽"
 
     return f"{rubles:.2f} ₽".replace(".", ",")
+
+def format_balance(kopecks: int) -> str:
+
+    if kopecks > 0:
+        return f"+{format_money(kopecks)}"
+
+    if kopecks < 0:
+        return f"-{format_money(-kopecks)}"
+
+    return "0 ₽"
+
 
 def format_datetime(value) -> str:
 
@@ -511,6 +604,7 @@ def get_history_records(chat_id: int):
         """
         SELECT
             id,
+            local_number,
             paid_by,
             amount_kopecks,
             comment,
@@ -526,6 +620,7 @@ def get_history_records(chat_id: int):
 
     for (
         expense_id,
+        local_number,
         paid_by,
         amount,
         comment,
@@ -536,6 +631,7 @@ def get_history_records(chat_id: int):
         records.append({
             "type": "expense",
             "id": expense_id,
+            "number": local_number,
             "paid_by": paid_by,
             "amount": amount,
             "comment": comment,
@@ -551,6 +647,7 @@ def get_history_records(chat_id: int):
         """
         SELECT
             id,
+            local_number,
             from_user,
             to_user,
             amount_kopecks,
@@ -566,6 +663,7 @@ def get_history_records(chat_id: int):
 
     for (
         settlement_id,
+        local_number,
         from_user,
         to_user,
         amount,
@@ -576,6 +674,7 @@ def get_history_records(chat_id: int):
         records.append({
             "type": "settlement",
             "id": settlement_id,
+            "number": local_number,
             "from_user": from_user,
             "to_user": to_user,
             "amount": amount,
@@ -600,27 +699,347 @@ async def replace_screen(
     reply_markup=None,
     parse_mode="HTML"
 ):
-    """
-    Удаляет текущий экран бота
-    и отправляет новый.
-    """
 
     chat_id = callback.message.chat.id
 
     try:
         await callback.message.delete()
     except TelegramBadRequest:
-        # Если Telegram по какой-то причине
-        # не дал удалить сообщение,
-        # бот всё равно продолжит работу.
         pass
 
-    await bot.send_message(
+    sent_message = await bot.send_message(
         chat_id=chat_id,
         text=text,
         parse_mode=parse_mode,
         reply_markup=reply_markup
     )
+
+    return sent_message
+
+def get_next_expense_number(chat_id: int) -> int:
+
+    cursor.execute(
+        """
+        SELECT COALESCE(MAX(local_number), 0) + 1
+        FROM expenses
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    return cursor.fetchone()[0]
+
+
+def get_next_settlement_number(chat_id: int) -> int:
+
+    cursor.execute(
+        """
+        SELECT COALESCE(MAX(local_number), 0) + 1
+        FROM settlements
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    return cursor.fetchone()[0]
+
+
+
+def calculate_expense_impact(
+    expense_id: int
+):
+
+    cursor.execute(
+        """
+        SELECT
+            paid_by,
+            amount_kopecks
+        FROM expenses
+        WHERE id = ?
+        """,
+        (expense_id,)
+    )
+
+    expense = cursor.fetchone()
+
+    if not expense:
+        return {}
+
+    paid_by, amount = expense
+
+    impact = {}
+
+    # Плательщику баланс увеличивается
+    impact[paid_by] = (
+        impact.get(paid_by, 0)
+        + amount
+    )
+
+    cursor.execute(
+        """
+        SELECT
+            user_id,
+            share_kopecks
+        FROM expense_participants
+        WHERE expense_id = ?
+        """,
+        (expense_id,)
+    )
+
+    participants = cursor.fetchall()
+
+    # Доля каждого уменьшает его баланс
+    for user_id, share in participants:
+
+        impact[user_id] = (
+            impact.get(user_id, 0)
+            - share
+        )
+
+    return impact
+
+
+async def remember_flow_message(
+    state: FSMContext,
+    message: Message
+):
+
+    data = await state.get_data()
+
+    message_ids = data.get(
+        "flow_bot_message_ids",
+        []
+    )
+
+    if message.message_id not in message_ids:
+        message_ids.append(
+            message.message_id
+        )
+
+    await state.update_data(
+        flow_bot_message_ids=message_ids
+    )
+
+
+async def cleanup_flow_messages(
+    chat_id: int,
+    state: FSMContext
+):
+
+    data = await state.get_data()
+
+    message_ids = data.get(
+        "flow_bot_message_ids",
+        []
+    )
+
+    for message_id in message_ids:
+
+        try:
+
+            await bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id
+            )
+
+        except TelegramBadRequest:
+            pass
+
+def get_operation_balance_changes(
+    chat_id: int,
+    target_type: str,
+    target_id: int
+):
+    """
+    Возвращает баланс участников
+    непосредственно ДО и ПОСЛЕ операции.
+
+    target_type:
+    "expense" или "settlement"
+    """
+
+    balances = {}
+
+    for user_id, first_name, username in get_members(chat_id):
+        balances[user_id] = 0
+
+    operations = []
+
+    # ====================================
+    # Расходы
+    # ====================================
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            paid_by,
+            amount_kopecks,
+            created_at
+        FROM expenses
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    for (
+        expense_id,
+        paid_by,
+        amount,
+        created_at
+    ) in cursor.fetchall():
+
+        operations.append({
+            "type": "expense",
+            "id": expense_id,
+            "created_at": created_at,
+            "paid_by": paid_by,
+            "amount": amount
+        })
+
+    # ====================================
+    # Переводы
+    # ====================================
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            from_user,
+            to_user,
+            amount_kopecks,
+            created_at
+        FROM settlements
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    for (
+        settlement_id,
+        from_user,
+        to_user,
+        amount,
+        created_at
+    ) in cursor.fetchall():
+
+        operations.append({
+            "type": "settlement",
+            "id": settlement_id,
+            "created_at": created_at,
+            "from_user": from_user,
+            "to_user": to_user,
+            "amount": amount
+        })
+
+    # ====================================
+    # Старые операции сначала
+    # ====================================
+
+    operations.sort(
+        key=lambda item: (
+            item["created_at"] or "",
+            0 if item["type"] == "expense" else 1,
+            item["id"]
+        )
+    )
+
+    for operation in operations:
+
+        is_target = (
+            operation["type"] == target_type
+            and
+            operation["id"] == target_id
+        )
+
+        # =================================
+        # РАСХОД
+        # =================================
+
+        if operation["type"] == "expense":
+
+            expense_id = operation["id"]
+            paid_by = operation["paid_by"]
+            amount = operation["amount"]
+
+            impact = {}
+
+            impact[paid_by] = (
+                impact.get(paid_by, 0)
+                + amount
+            )
+
+            cursor.execute(
+                """
+                SELECT
+                    user_id,
+                    share_kopecks
+                FROM expense_participants
+                WHERE expense_id = ?
+                """,
+                (expense_id,)
+            )
+
+            for user_id, share in cursor.fetchall():
+
+                impact[user_id] = (
+                    impact.get(user_id, 0)
+                    - share
+                )
+
+        # =================================
+        # ПЕРЕВОД
+        # =================================
+
+        else:
+
+            from_user = operation["from_user"]
+            to_user = operation["to_user"]
+            amount = operation["amount"]
+
+            impact = {
+                from_user: amount,
+                to_user: -amount
+            }
+
+        # =================================
+        # Если это нужная операция —
+        # запоминаем было → стало
+        # =================================
+
+        if is_target:
+
+            result = {}
+
+            for user_id, change in impact.items():
+
+                before = balances.get(
+                    user_id,
+                    0
+                )
+
+                after = before + change
+
+                result[user_id] = (
+                    before,
+                    after
+                )
+
+            return result
+
+        # =================================
+        # Иначе применяем операцию
+        # и идём дальше
+        # =================================
+
+        for user_id, change in impact.items():
+
+            balances[user_id] = (
+                balances.get(user_id, 0)
+                + change
+            )
+
+    return {}
 
 # ============================================================
 # КЛАВИАТУРЫ
@@ -1056,13 +1475,17 @@ async def add_expense_handler(
         ExpenseForm.choosing_payer
     )
 
-    await replace_screen(
+    screen = await replace_screen(
         callback,
         "💳 <b>Кто заплатил?</b>",
         reply_markup=get_payer_keyboard(chat_id)
     )
 
-    await callback.answer()
+    await state.update_data(
+        flow_bot_message_ids=[
+            screen.message_id
+        ]
+    )
 
 
 # ============================================================
@@ -1099,7 +1522,7 @@ async def choose_payer(
         ExpenseForm.entering_amount
     )
 
-    await callback.message.answer(
+    prompt = await callback.message.answer(
         f"💰 <b>Введите сумму расхода</b>\n\n"
         f"Заплатил: <b>{escape(payer_name)}</b>\n\n"
         f"Например:\n"
@@ -1113,7 +1536,10 @@ async def choose_payer(
         )
     )
 
-    await callback.answer()
+    await remember_flow_message(
+        state,
+        prompt
+    )
 
 
 # ============================================================
@@ -1154,7 +1580,7 @@ async def enter_amount(
         ExpenseForm.choosing_participants
     )
 
-    await message.answer(
+    prompt = await message.answer(
         "👥 <b>Между кем делим расход?</b>\n\n"
         "Нажмите на людей, которые участвовали "
         "в этом расходе.\n\n"
@@ -1165,6 +1591,11 @@ async def enter_amount(
             message.chat.id,
             []
         )
+    )
+
+    await remember_flow_message(
+        state,
+        prompt
     )
 
 
@@ -1300,7 +1731,7 @@ async def participants_done(
         ExpenseForm.entering_comment
     )
 
-    await callback.message.answer(
+    prompt = await callback.message.answer(
         "💬 <b>Введите комментарий</b>\n\n"
         "Например:\n"
         "<code>Такси</code>\n"
@@ -1315,7 +1746,10 @@ async def participants_done(
         )
     )
 
-    await callback.answer()
+    await remember_flow_message(
+        state,
+        prompt
+    )
 
 
 # ============================================================
@@ -1364,21 +1798,26 @@ async def enter_comment(
     # ------------------------------------
     # Сохраняем расход
     # ------------------------------------
-
+    expense_number = get_next_expense_number(
+        chat_id
+    )   
+    
     cursor.execute(
         """
         INSERT INTO expenses
         (
             chat_id,
+            local_number,
             paid_by,
             amount_kopecks,
             comment,
             created_by
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             chat_id,
+            expense_number,
             payer_id,
             amount_kopecks,
             comment,
@@ -1459,13 +1898,21 @@ async def enter_comment(
             f"{format_money(share)}\n"
         )
 
+    await cleanup_flow_messages(
+        chat_id,
+        state
+    )
+
+    await state.clear()
+
+
     await message.answer(
         text,
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
 
-    await state.clear()
+    
 
 
 # ============================================================
@@ -1477,6 +1924,11 @@ async def cancel_expense(
     callback: CallbackQuery,
     state: FSMContext
 ):
+    
+    await cleanup_flow_messages(
+        callback.message.chat.id,
+        state
+    )
 
     await state.clear()
 
@@ -1598,7 +2050,7 @@ async def show_history_page(
 
             text += (
                 f"🧾 <b>Расход "
-                f"#{record['id']} — "
+                f"#{record['number']} — "
                 f"{escape(title)}</b>\n"
                 f"💰 "
                 f"{format_money(record['amount'])}\n"
@@ -1621,7 +2073,7 @@ async def show_history_page(
             keyboard_rows.append([
                 InlineKeyboardButton(
                     text=(
-                        f"🧾 #{record['id']} "
+                        f"🧾 #{record['number']} "
                         f"{button_title}"
                     ),
                     callback_data=(
@@ -1654,7 +2106,7 @@ async def show_history_page(
 
             text += (
                 f"💸 <b>Перевод "
-                f"#{record['id']}</b>\n"
+                f"#{record['number']}</b>\n"
                 f"{escape(from_name)} → "
                 f"{escape(to_name)}: "
                 f"<b>"
@@ -1669,7 +2121,7 @@ async def show_history_page(
             keyboard_rows.append([
                 InlineKeyboardButton(
                     text=(
-                        f"💸 #{record['id']} "
+                        f"💸 #{record['number']} "
                         f"{from_name} → {to_name}"
                     ),
                     callback_data=(
@@ -2086,6 +2538,7 @@ async def expense_view_handler(
     cursor.execute(
         """
         SELECT
+            local_number,
             paid_by,
             amount_kopecks,
             comment,
@@ -2113,6 +2566,7 @@ async def expense_view_handler(
         return
 
     (
+        local_number,
         paid_by,
         amount,
         comment,
@@ -2136,7 +2590,7 @@ async def expense_view_handler(
         title = "Без комментария"
 
     text = (
-        f"🧾 <b>Расход #{expense_id}</b>\n\n"
+        f"🧾 <b>Расход #{local_number}</b>\n\n"
         f"📝 {title}\n"
         f"💰 Сумма: "
         f"<b>{format_money(amount)}</b>\n"
@@ -2174,6 +2628,36 @@ async def expense_view_handler(
             f"• {escape(name)} — "
             f"{format_money(share)}\n"
         )
+
+    changes = get_operation_balance_changes(
+        chat_id,
+        "expense",
+        expense_id
+    )
+
+    text += (
+        "\n📊 <b>Баланс: было → стало</b>\n"
+    )
+
+    for user_id, (
+        before,
+        after
+    ) in changes.items():
+
+        name = get_member_name(
+            chat_id,
+            user_id
+        )
+
+        text += (
+            f"• {escape(name)}: "
+            f"<b>{format_balance(before)}</b>"
+            f" → "
+            f"<b>{format_balance(after)}</b>\n"
+        )    
+
+    
+        
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3055,6 +3539,7 @@ async def settlement_view_handler(
     cursor.execute(
         """
         SELECT
+            local_number,
             from_user,
             to_user,
             amount_kopecks,
@@ -3082,6 +3567,7 @@ async def settlement_view_handler(
         return
 
     (
+        local_number,
         from_user,
         to_user,
         amount,
@@ -3106,7 +3592,7 @@ async def settlement_view_handler(
 
     text = (
         f"💸 <b>Перевод "
-        f"#{settlement_id}</b>\n\n"
+        f"#{local_number}</b>\n\n"
         f"👤 От: "
         f"<b>{escape(from_name)}</b>\n"
         f"👤 Кому: "
@@ -3118,6 +3604,33 @@ async def settlement_view_handler(
         f"✍️ Отметил: "
         f"{escape(creator_name)}"
     )
+
+    changes = get_operation_balance_changes(
+        chat_id,
+        "settlement",
+        settlement_id
+    )
+
+    text += (
+        "\n\n📊 <b>Баланс: было → стало</b>\n"
+    )
+
+    for user_id, (
+        before,
+        after
+    ) in changes.items():
+
+        name = get_member_name(
+            chat_id,
+            user_id
+        )
+
+        text += (
+            f"• {escape(name)}: "
+            f"<b>{format_balance(before)}</b>"
+            f" → "
+            f"<b>{format_balance(after)}</b>\n"
+        )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3592,21 +4105,26 @@ async def settlement_done_handler(
     # ------------------------------------
     # Записываем расчёт в базу
     # ------------------------------------
+    settlement_number = get_next_settlement_number(
+        chat_id
+    )
 
     cursor.execute(
         """
         INSERT INTO settlements
         (
             chat_id,
+            local_number,
             from_user,
             to_user,
             amount_kopecks,
             created_by
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             chat_id,
+            settlement_number,
             from_user,
             to_user,
             amount,
