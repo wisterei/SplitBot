@@ -19,6 +19,9 @@ from aiogram.types import (
     ForceReply,
 )
 
+from aiogram.client.session.aiohttp import AiohttpSession #для сервака
+
+
 from dotenv import load_dotenv
 
 
@@ -32,7 +35,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 DISPLAY_TIMEZONE = ZoneInfo("Europe/Moscow")
 HISTORY_PAGE_SIZE = 10
 
-bot = Bot(token=TOKEN)
+session = AiohttpSession(proxy="socks5://127.0.0.1:10808") #для сервака
+bot = Bot(token=TOKEN, session=session)
+
+#bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
