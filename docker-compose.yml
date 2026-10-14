@@ -1,7 +1,7 @@
 services:
   bot:
     build: .
-    container_name: split-bot
+    container_name: splitwise-bot
     restart: unless-stopped
     # Сеть хоста: контейнер видит прокси на 127.0.0.1 (xray). Порты бот не открывает.
     network_mode: host
