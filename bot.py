@@ -6,8 +6,9 @@ from html import escape
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from aiogram.exceptions import TelegramBadRequest
-from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.dispatcher.flags import get_flag
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -105,6 +106,16 @@ CREATE TABLE IF NOT EXISTS settlements (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
+
+# Какую группу пользователь выбрал
+# для работы с ботом в личных сообщениях
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_active_group (
+    user_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL
+)
+""")
+
 # Если база была создана раньше,
 # добавляем поле created_by автоматически.
 
@@ -1048,10 +1059,318 @@ def get_operation_balance_changes(
     return {}
 
 # ============================================================
+# ЛИЧНЫЕ СООБЩЕНИЯ: ВЫБРАННАЯ ГРУППА
+# ============================================================
+
+def is_private(chat) -> bool:
+    return chat.type == "private"
+
+
+def get_group_title(chat_id: int) -> str:
+
+    cursor.execute(
+        """
+        SELECT title
+        FROM groups
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    result = cursor.fetchone()
+
+    if result and result[0]:
+        return result[0]
+
+    return f"Группа {chat_id}"
+
+
+def is_group_member(chat_id: int, user_id: int) -> bool:
+
+    cursor.execute(
+        """
+        SELECT 1
+        FROM group_members
+        WHERE chat_id = ? AND user_id = ?
+        """,
+        (chat_id, user_id)
+    )
+
+    return cursor.fetchone() is not None
+
+
+def get_active_group_id(user_id: int):
+
+    cursor.execute(
+        """
+        SELECT chat_id
+        FROM user_active_group
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    )
+
+    result = cursor.fetchone()
+
+    if not result:
+        return None
+
+    chat_id = result[0]
+
+    # Пользователь мог перестать быть
+    # участником этой группы
+    if not is_group_member(chat_id, user_id):
+        return None
+
+    return chat_id
+
+
+def set_active_group_id(user_id: int, chat_id: int):
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO user_active_group
+        (user_id, chat_id)
+        VALUES (?, ?)
+        """,
+        (user_id, chat_id)
+    )
+
+    db.commit()
+
+
+async def is_in_telegram_group(
+    chat_id: int,
+    user_id: int
+) -> bool:
+    """
+    Проверяет через Telegram, что и бот,
+    и пользователь всё ещё состоят в группе.
+    """
+
+    try:
+
+        member = await bot.get_chat_member(
+            chat_id=chat_id,
+            user_id=user_id
+        )
+
+    except TelegramAPIError:
+
+        # Бота удалили из группы,
+        # группа удалена или стала супергруппой
+        return False
+
+    if member.status == "restricted":
+        return member.is_member
+
+    return member.status not in ("left", "kicked")
+
+
+async def get_user_groups(user_id: int):
+    """
+    Группы, в которых пользователь
+    нажал «Я участвую» и где он до сих пор состоит.
+    """
+
+    cursor.execute(
+        """
+        SELECT gm.chat_id
+        FROM group_members gm
+        WHERE gm.user_id = ?
+        """,
+        (user_id,)
+    )
+
+    chat_ids = [
+        row[0]
+        for row in cursor.fetchall()
+    ]
+
+    groups = []
+
+    for chat_id in chat_ids:
+
+        if await is_in_telegram_group(chat_id, user_id):
+
+            groups.append((
+                chat_id,
+                get_group_title(chat_id)
+            ))
+
+    groups.sort(
+        key=lambda item: item[1].lower()
+    )
+
+    return groups
+
+
+async def get_group_picker(user_id: int):
+    """
+    Возвращает текст и клавиатуру
+    экрана выбора группы.
+    """
+
+    groups = await get_user_groups(user_id)
+
+    if not groups:
+
+        text = (
+            "🤷 <b>Не нашёл групп, где ты участвуешь.</b>\n\n"
+            "Добавь меня в Telegram-группу, отправь там "
+            "/menu и нажми «🙋 Я участвую» — после этого "
+            "группа появится здесь.\n\n"
+            "Потом снова отправь мне /groups."
+        )
+
+        return text, None
+
+    active_group_id = get_active_group_id(user_id)
+
+    rows = []
+
+    for chat_id, title in groups:
+
+        icon = (
+            "✅"
+            if chat_id == active_group_id
+            else "👥"
+        )
+
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {title}",
+                callback_data=f"select_group:{chat_id}"
+            )
+        ])
+
+    text = (
+        "👥 <b>Выберите группу</b>\n\n"
+        "Все действия в этом чате будут относиться "
+        "к выбранной группе, пока вы её не смените."
+    )
+
+    return text, InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def get_menu_text(group_id: int, private: bool) -> str:
+
+    text = "💸 <b>Общие расходы</b>\n\n"
+
+    if private:
+        text += (
+            f"👥 Группа: "
+            f"<b>{escape(get_group_title(group_id))}</b>\n\n"
+        )
+
+    text += (
+        "Добавляйте расходы, следите за балансами "
+        "и рассчитывайтесь друг с другом."
+    )
+
+    return text
+
+
+class GroupContextMiddleware(BaseMiddleware):
+    """
+    Передаёт в обработчики group_id —
+    группу, с которой идёт работа.
+
+    В группе это сам чат.
+    В личных сообщениях — группа,
+    которую пользователь выбрал.
+    """
+
+    async def __call__(self, handler, event, data):
+
+        if isinstance(event, CallbackQuery):
+            chat = event.message.chat
+        else:
+            chat = event.chat
+
+        if not is_private(chat):
+
+            data["group_id"] = chat.id
+
+            return await handler(event, data)
+
+        group_id = get_active_group_id(
+            event.from_user.id
+        )
+
+        data["group_id"] = group_id
+
+        if (
+            group_id is None
+            and
+            not get_flag(data, "without_group")
+        ):
+
+            await data["state"].clear()
+
+            text, keyboard = await get_group_picker(
+                event.from_user.id
+            )
+
+            if isinstance(event, CallbackQuery):
+
+                await event.answer()
+
+                await event.message.answer(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+
+            else:
+
+                await event.answer(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+
+            return
+
+        return await handler(event, data)
+
+
+dp.message.middleware(GroupContextMiddleware())
+dp.callback_query.middleware(GroupContextMiddleware())
+
+# ============================================================
 # КЛАВИАТУРЫ
 # ============================================================
 
-def get_main_keyboard():
+def get_main_keyboard(private: bool = False):
+
+    if private:
+
+        last_row = [
+            InlineKeyboardButton(
+                text="👥 Участники",
+                callback_data="members"
+            ),
+            InlineKeyboardButton(
+                text="🔄 Сменить группу",
+                callback_data="switch_group"
+            )
+        ]
+
+    else:
+
+        last_row = [
+            InlineKeyboardButton(
+                text="👥 Участники",
+                callback_data="members"
+            ),
+            InlineKeyboardButton(
+                text="🙋 Я участвую",
+                callback_data="join"
+            )
+        ]
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1083,16 +1402,7 @@ def get_main_keyboard():
                     callback_data="settle"
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Участники",
-                    callback_data="members"
-                ),
-                InlineKeyboardButton(
-                    text="🙋 Я участвую",
-                    callback_data="join"
-                )
-            ]
+            last_row
         ]
     )
 
@@ -1274,17 +1584,36 @@ def get_back_to_main_keyboard():
 # /START
 # ============================================================
 
-@dp.message(CommandStart())
-async def start_handler(message: Message):
+@dp.message(
+    CommandStart(),
+    flags={"without_group": True}
+)
+async def start_handler(
+    message: Message,
+    group_id: int | None
+):
 
-    if message.chat.type == "private":
+    if is_private(message.chat):
 
-        await message.answer(
-            "👋 Привет!\n\n"
-            "Я бот для совместных расходов.\n\n"
-            "Добавь меня в Telegram-группу, "
-            "где вы хотите делить расходы."
-        )
+        if group_id is None:
+
+            text, keyboard = await get_group_picker(
+                message.from_user.id
+            )
+
+            await message.answer(
+                "👋 Привет!\n\n"
+                "Я бот для совместных расходов.\n"
+                "Со мной можно работать и в группе, "
+                "и здесь, в личных сообщениях.\n\n"
+                + text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+
+            return
+
+        await show_private_menu(message, group_id)
 
         return
 
@@ -1293,21 +1622,18 @@ async def start_handler(message: Message):
 @dp.callback_query(F.data == "main_menu")
 async def main_menu_callback(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     await state.clear()
 
-    text = (
-        "💸 <b>Общие расходы</b>\n\n"
-        "Добавляйте расходы, следите за балансами "
-        "и рассчитывайтесь друг с другом."
-    )
+    private = is_private(callback.message.chat)
 
     await replace_screen(
         callback,
-        text,
-        reply_markup=get_main_keyboard()
+        get_menu_text(group_id, private),
+        reply_markup=get_main_keyboard(private)
     )
 
     await callback.answer()
@@ -1315,15 +1641,32 @@ async def main_menu_callback(
 # /MENU
 # ============================================================
 
-@dp.message(Command("menu"))
-async def menu_handler(message: Message):
+@dp.message(
+    Command("menu"),
+    flags={"without_group": True}
+)
+async def menu_handler(
+    message: Message,
+    group_id: int | None
+):
 
-    if message.chat.type == "private":
+    if is_private(message.chat):
 
-        await message.answer(
-            "Добавь меня в группу, "
-            "чтобы начать вести общие расходы."
-        )
+        if group_id is None:
+
+            text, keyboard = await get_group_picker(
+                message.from_user.id
+            )
+
+            await message.answer(
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+
+            return
+
+        await show_private_menu(message, group_id)
 
         return
 
@@ -1347,11 +1690,130 @@ async def show_menu(message: Message):
     db.commit()
 
     await message.answer(
-        "💸 <b>Общие расходы</b>\n\n"
-        "Добавляйте расходы, следите за балансами "
-        "и рассчитывайтесь друг с другом.",
+        get_menu_text(message.chat.id, False),
         reply_markup=get_main_keyboard(),
         parse_mode="HTML"
+    )
+
+
+async def show_private_menu(
+    message: Message,
+    group_id: int
+):
+
+    await message.answer(
+        get_menu_text(group_id, True),
+        reply_markup=get_main_keyboard(True),
+        parse_mode="HTML"
+    )
+
+
+# ============================================================
+# 👥 ВЫБОР ГРУППЫ В ЛИЧНЫХ СООБЩЕНИЯХ
+# ============================================================
+
+@dp.message(
+    Command("groups"),
+    flags={"without_group": True}
+)
+async def groups_command_handler(
+    message: Message,
+    state: FSMContext
+):
+
+    if not is_private(message.chat):
+
+        await message.answer(
+            "Выбор группы нужен только "
+            "в личных сообщениях со мной."
+        )
+
+        return
+
+    await state.clear()
+
+    text, keyboard = await get_group_picker(
+        message.from_user.id
+    )
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(
+    F.data == "switch_group",
+    flags={"without_group": True}
+)
+async def switch_group_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    await state.clear()
+
+    text, keyboard = await get_group_picker(
+        callback.from_user.id
+    )
+
+    await replace_screen(
+        callback,
+        text,
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("select_group:"),
+    flags={"without_group": True}
+)
+async def select_group_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if not is_private(callback.message.chat):
+
+        await callback.answer()
+
+        return
+
+    chat_id = int(
+        callback.data.split(":")[1]
+    )
+
+    user_id = callback.from_user.id
+
+    if (
+        not is_group_member(chat_id, user_id)
+        or
+        not await is_in_telegram_group(chat_id, user_id)
+    ):
+
+        await callback.answer(
+            "Эта группа недоступна. "
+            "Выберите другую.",
+            show_alert=True
+        )
+
+        return
+
+    set_active_group_id(user_id, chat_id)
+
+    await state.clear()
+
+    await replace_screen(
+        callback,
+        get_menu_text(chat_id, True),
+        reply_markup=get_main_keyboard(True)
+    )
+
+    await callback.answer(
+        f"Выбрана группа: {get_group_title(chat_id)}"
     )
 
 
@@ -1401,9 +1863,12 @@ async def join_handler(callback: CallbackQuery):
 # ============================================================
 
 @dp.callback_query(F.data == "members")
-async def members_handler(callback: CallbackQuery):
+async def members_handler(
+    callback: CallbackQuery,
+    group_id: int
+):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     members = get_members(chat_id)
 
@@ -1459,10 +1924,11 @@ async def members_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "add_expense")
 async def add_expense_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     members = get_members(chat_id)
 
@@ -1504,14 +1970,15 @@ async def add_expense_handler(
 )
 async def choose_payer(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     payer_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     payer_name = get_member_name(
         chat_id,
@@ -1555,7 +2022,8 @@ async def choose_payer(
 @dp.message(ExpenseForm.entering_amount)
 async def enter_amount(
     message: Message,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     amount_kopecks = parse_money(
@@ -1594,7 +2062,7 @@ async def enter_amount(
         "⬜ — не выбран",
         parse_mode="HTML",
         reply_markup=get_participants_keyboard(
-            message.chat.id,
+            group_id,
             []
         )
     )
@@ -1615,7 +2083,8 @@ async def enter_amount(
 )
 async def toggle_participant(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     user_id = int(
@@ -1643,7 +2112,7 @@ async def toggle_participant(
 
     await callback.message.edit_reply_markup(
         reply_markup=get_participants_keyboard(
-            callback.message.chat.id,
+            group_id,
             selected_users
         )
     )
@@ -1661,11 +2130,12 @@ async def toggle_participant(
 )
 async def select_all_participants(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     members = get_members(
-        callback.message.chat.id
+        group_id
     )
 
     all_users = [
@@ -1696,7 +2166,7 @@ async def select_all_participants(
 
     await callback.message.edit_reply_markup(
         reply_markup=get_participants_keyboard(
-            callback.message.chat.id,
+            group_id,
             selected_users
         )
     )
@@ -1904,8 +2374,10 @@ async def enter_comment(
             f"{format_money(share)}\n"
         )
 
+    # Сообщения удаляем в том чате, где шёл диалог:
+    # в личке он не совпадает с группой расхода.
     await cleanup_flow_messages(
-        chat_id,
+        message.chat.id,
         state
     )
 
@@ -1915,7 +2387,9 @@ async def enter_comment(
     await message.answer(
         text,
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(message.chat)
+        )
     )
 
     
@@ -1953,11 +2427,12 @@ async def cancel_expense(
 
 async def show_history_page(
     callback: CallbackQuery,
+    group_id: int,
     page: int,
     edit_message: bool = False
 ):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     records = get_history_records(
         chat_id
@@ -2209,7 +2684,8 @@ async def show_history_page(
 
 @dp.callback_query(F.data == "history")
 async def history_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     try:
@@ -2219,6 +2695,7 @@ async def history_handler(
 
     await show_history_page(
         callback,
+        group_id,
         page=0,
         edit_message=False
     )
@@ -2229,7 +2706,8 @@ async def history_handler(
     F.data.startswith("history_page:")
 )
 async def history_page_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     page = int(
@@ -2238,6 +2716,7 @@ async def history_page_handler(
 
     await show_history_page(
         callback,
+        group_id,
         page=page,
         edit_message=True
     )
@@ -2260,10 +2739,11 @@ async def history_ignore_handler(
 
 @dp.callback_query(F.data == "statistics")
 async def statistics_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     # ========================================================
     # ОСНОВНАЯ СТАТИСТИКА
@@ -2532,14 +3012,15 @@ async def statistics_handler(
     F.data.startswith("expense_view:")
 )
 async def expense_view_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -2709,7 +3190,8 @@ async def expense_view_handler(
 )
 async def expense_edit_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     await state.clear()
@@ -2718,11 +3200,12 @@ async def expense_edit_handler(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
         SELECT
+            local_number,
             paid_by,
             amount_kopecks,
             comment
@@ -2746,7 +3229,7 @@ async def expense_edit_handler(
         )
         return
 
-    paid_by, amount, comment = expense
+    local_number, paid_by, amount, comment = expense
 
     payer_name = get_member_name(
         chat_id,
@@ -2807,7 +3290,7 @@ async def expense_edit_handler(
 
     await callback.message.answer(
         f"✏️ <b>Редактирование расхода "
-        f"#{expense_id}</b>\n\n"
+        f"#{local_number}</b>\n\n"
         f"📝 {escape(title)}\n"
         f"💰 {format_money(amount)}\n"
         f"💳 Заплатил: "
@@ -2828,14 +3311,15 @@ async def expense_edit_handler(
 )
 async def expense_edit_amount_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -2947,7 +3431,9 @@ async def edit_expense_amount_message(
         f"<b>{format_money(amount)}</b>\n\n"
         "📊 Балансы пересчитаны автоматически.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(message.chat)
+        )
     )
 # ============================================================
 # 💳 ИЗМЕНЕНИЕ ПЛАТЕЛЬЩИКА
@@ -2958,14 +3444,15 @@ async def edit_expense_amount_message(
 )
 async def expense_edit_payer_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     await state.set_state(
         EditExpenseForm.choosing_payer
@@ -2994,7 +3481,8 @@ async def expense_edit_payer_handler(
 )
 async def edit_payer_selected(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     parts = callback.data.split(":")
@@ -3002,7 +3490,7 @@ async def edit_payer_selected(
     expense_id = int(parts[1])
     payer_id = int(parts[2])
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -3033,7 +3521,9 @@ async def edit_payer_selected(
         f"<b>{escape(payer_name)}</b>\n\n"
         "📊 Балансы пересчитаны автоматически.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
     )
 
     await callback.answer()
@@ -3051,14 +3541,15 @@ async def edit_payer_selected(
 )
 async def expense_edit_participants_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     selected_users = (
         get_expense_participant_ids(
@@ -3095,7 +3586,8 @@ async def expense_edit_participants_handler(
 )
 async def edit_participant_toggle(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     user_id = int(
@@ -3121,7 +3613,7 @@ async def edit_participant_toggle(
     await callback.message.edit_reply_markup(
         reply_markup=(
             get_edit_participants_keyboard(
-                callback.message.chat.id,
+                group_id,
                 selected
             )
         )
@@ -3135,11 +3627,12 @@ async def edit_participant_toggle(
 )
 async def edit_participants_all_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     members = get_members(
-        callback.message.chat.id
+        group_id
     )
 
     all_users = [
@@ -3166,7 +3659,7 @@ async def edit_participants_all_handler(
     await callback.message.edit_reply_markup(
         reply_markup=(
             get_edit_participants_keyboard(
-                callback.message.chat.id,
+                group_id,
                 selected
             )
         )
@@ -3245,7 +3738,9 @@ async def edit_participants_done_handler(
         "✅ <b>Участники изменены!</b>\n\n"
         "Доли и балансы пересчитаны автоматически.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
     )
 
     await callback.answer()
@@ -3261,14 +3756,15 @@ async def edit_participants_done_handler(
 )
 async def expense_edit_comment_handler(
     callback: CallbackQuery,
-    state: FSMContext
+    state: FSMContext,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     await state.set_state(
         EditExpenseForm.entering_comment
@@ -3337,7 +3833,9 @@ async def edit_comment_message(
     await message.answer(
         "✅ <b>Комментарий изменён!</b>",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(message.chat)
+        )
     )
 
 @dp.callback_query(
@@ -3352,7 +3850,9 @@ async def edit_cancel_handler(
 
     await callback.message.answer(
         "👌 Редактирование отменено.",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
     )
 
     await callback.answer()
@@ -3364,14 +3864,15 @@ async def edit_cancel_handler(
     F.data.startswith("expense_delete:")
 )
 async def expense_delete_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -3444,18 +3945,19 @@ async def expense_delete_handler(
     F.data.startswith("expense_delete_confirm:")
 )
 async def expense_delete_confirm_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     expense_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
-        SELECT id
+        SELECT local_number
         FROM expenses
         WHERE id = ?
         AND chat_id = ?
@@ -3466,13 +3968,17 @@ async def expense_delete_confirm_handler(
         )
     )
 
-    if not cursor.fetchone():
+    expense = cursor.fetchone()
+
+    if not expense:
 
         await callback.answer(
             "Расход уже удалён.",
             show_alert=True
         )
         return
+
+    local_number = expense[0]
 
     # Сначала удаляем участников расхода
     cursor.execute(
@@ -3499,10 +4005,12 @@ async def expense_delete_confirm_handler(
     db.commit()
 
     await callback.message.answer(
-        f"🗑 <b>Расход #{expense_id} удалён.</b>\n\n"
+        f"🗑 <b>Расход #{local_number} удалён.</b>\n\n"
         "📊 Балансы пересчитаны автоматически.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
     )
 
     await callback.answer(
@@ -3533,14 +4041,15 @@ async def expense_delete_cancel_handler(
     F.data.startswith("settlement_view:")
 )
 async def settlement_view_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     settlement_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -3680,14 +4189,15 @@ async def settlement_view_handler(
     F.data.startswith("settlement_delete:")
 )
 async def settlement_delete_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     settlement_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     cursor.execute(
         """
@@ -3772,14 +4282,32 @@ async def settlement_delete_handler(
     F.data.startswith("settlement_delete_confirm:")
 )
 async def settlement_delete_confirm_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     settlement_id = int(
         callback.data.split(":")[1]
     )
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
+
+    # Номер перевода в группе нужно узнать
+    # до удаления, чтобы показать его в ответе
+    cursor.execute(
+        """
+        SELECT local_number
+        FROM settlements
+        WHERE id = ?
+        AND chat_id = ?
+        """,
+        (
+            settlement_id,
+            chat_id
+        )
+    )
+
+    settlement = cursor.fetchone()
 
     cursor.execute(
         """
@@ -3806,10 +4334,12 @@ async def settlement_delete_confirm_handler(
         return
 
     await callback.message.answer(
-        f"↩️ <b>Перевод #{settlement_id} отменён.</b>\n\n"
+        f"↩️ <b>Перевод #{settlement[0]} отменён.</b>\n\n"
         "📊 Балансы пересчитаны автоматически.",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
     )
 
     await callback.answer(
@@ -3823,10 +4353,11 @@ async def settlement_delete_confirm_handler(
 
 @dp.callback_query(F.data == "balances")
 async def balances_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     balances = calculate_balances(
         chat_id
@@ -3933,10 +4464,11 @@ async def balances_handler(
 
 @dp.callback_query(F.data == "settle")
 async def settle_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     balances = calculate_balances(
         chat_id
@@ -4037,7 +4569,8 @@ async def settle_handler(
     F.data.startswith("settlement_done:")
 )
 async def settlement_done_handler(
-    callback: CallbackQuery
+    callback: CallbackQuery,
+    group_id: int
 ):
 
     parts = callback.data.split(":")
@@ -4046,7 +4579,7 @@ async def settlement_done_handler(
     to_user = int(parts[2])
     amount = int(parts[3])
 
-    chat_id = callback.message.chat.id
+    chat_id = group_id
 
     # ------------------------------------
     # Перевод может отметить только тот,
