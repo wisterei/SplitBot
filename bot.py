@@ -727,6 +727,28 @@ async def replace_screen(
 
     chat_id = callback.message.chat.id
 
+    # В личке меняем текущее сообщение.
+    # В группе удаляем и отправляем новое,
+    # чтобы меню оставалось внизу чата.
+    if is_private(callback.message.chat):
+
+        try:
+
+            return await callback.message.edit_text(
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+
+        except TelegramBadRequest as error:
+
+            # Нажали «Обновить», а ничего не изменилось
+            if "message is not modified" in str(error):
+                return callback.message
+
+            # Сообщение уже удалено или его нельзя
+            # изменить — отправляем новое, как в группе
+
     try:
         await callback.message.delete()
     except TelegramBadRequest:
@@ -2455,13 +2477,15 @@ async def show_history_page(
         if edit_message:
 
             await callback.message.edit_text(
-                "📜 История пока пустая."
+                "📜 История пока пустая.",
+                reply_markup=get_back_to_main_keyboard()
             )
 
         else:
 
             await callback.message.answer(
-                "📜 История пока пустая."
+                "📜 История пока пустая.",
+                reply_markup=get_back_to_main_keyboard()
             )
 
         return
@@ -2696,16 +2720,21 @@ async def history_handler(
     group_id: int
 ):
 
-    try:
-        await callback.message.delete()
-    except TelegramBadRequest:
-        pass
+    # В личке открываем историю в том же сообщении
+    private = is_private(callback.message.chat)
+
+    if not private:
+
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
 
     await show_history_page(
         callback,
         group_id,
         page=0,
-        edit_message=False
+        edit_message=private
     )
 
     await callback.answer()
