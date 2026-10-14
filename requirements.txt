@@ -1,0 +1,4 @@
+aiogram==3.30.0
+aiohttp-socks==0.12.0
+python-dotenv==1.2.3
+tzdata==2026.3

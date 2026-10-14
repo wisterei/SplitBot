@@ -17,3 +17,5 @@ venv/
 # IDE
 .vscode/
 .idea/
+# Docker: база на сервере
+data/

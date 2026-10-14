@@ -36,10 +36,18 @@ TOKEN = os.getenv("BOT_TOKEN")
 DISPLAY_TIMEZONE = ZoneInfo("Europe/Moscow")
 HISTORY_PAGE_SIZE = 10
 
-session = AiohttpSession(proxy="socks5://127.0.0.1:10808") #для сервака
-bot = Bot(token=TOKEN, session=session)
+# Прокси для доступа к Telegram (на сервере — xray).
+# Чтобы работать без прокси, задайте в .env пустое PROXY_URL=
+PROXY_URL = os.getenv("PROXY_URL", "socks5://127.0.0.1:10808")
 
-#bot = Bot(token=TOKEN)
+# В Docker база лежит в примонтированной папке /app/data
+DATABASE_PATH = os.getenv("DATABASE_PATH", "splitwise.db")
+
+if PROXY_URL:
+    bot = Bot(token=TOKEN, session=AiohttpSession(proxy=PROXY_URL))
+else:
+    bot = Bot(token=TOKEN)
+
 dp = Dispatcher()
 
 
@@ -47,7 +55,7 @@ dp = Dispatcher()
 # БАЗА ДАННЫХ
 # ============================================================
 
-db = sqlite3.connect("splitwise.db")
+db = sqlite3.connect(DATABASE_PATH)
 cursor = db.cursor()
 
 
