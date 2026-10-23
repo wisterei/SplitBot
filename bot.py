@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import sqlite3
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
@@ -305,41 +306,230 @@ def format_datetime(value) -> str:
 
         return str(value)
 
-def parse_money(text: str):
-    """
-    Превращает:
-    2500
-    2500.50
-    2500,50
+# Больше 100 млн ₽ за раз не бывает,
+# а огромные числа не влезут в базу.
+MAX_AMOUNT_KOPECKS = 100_000_000 * 100
 
-    в количество копеек.
-    """
+MAX_EXPRESSION_LENGTH = 100
 
-    cleaned = (
+EXPRESSION_TOKEN = re.compile(
+    r"\d+(?:\.\d*)?|\.\d+|[-+*/()]"
+)
+
+
+def clean_money_text(text: str) -> str:
+
+    return (
         text
         .replace("₽", "")
         .replace("руб.", "")
         .replace("руб", "")
         .replace(" ", "")
         .replace(",", ".")
+        # Другие способы написать знаки
+        .replace("×", "*")
+        .replace("х", "*")
+        .replace("x", "*")
+        .replace("÷", "/")
+        .replace(":", "/")
+        .replace("−", "-")
+        .replace("–", "-")
         .strip()
     )
 
-    try:
-        value = Decimal(cleaned)
 
-        if value <= 0:
-            return None
+def calculate_expression(text: str):
+    """
+    Считает выражение из чисел,
+    + - * / и скобок, например:
+    99+322
+    (1200+800)/3
+
+    eval не используем — так нельзя
+    выполнить через бота чужой код.
+
+    Возвращает Decimal или None,
+    если выражение некорректное.
+    """
+
+    if not text or len(text) > MAX_EXPRESSION_LENGTH:
+        return None
+
+    tokens = EXPRESSION_TOKEN.findall(text)
+
+    # Если что-то не попало в токены —
+    # в тексте есть посторонние символы
+    if "".join(tokens) != text:
+        return None
+
+    position = 0
+
+    def peek():
+        if position < len(tokens):
+            return tokens[position]
+        return None
+
+    def take():
+        nonlocal position
+        position += 1
+        return tokens[position - 1]
+
+    # выражение := слагаемое (+|- слагаемое)*
+    def parse_sum():
+
+        value = parse_product()
+
+        while peek() in ("+", "-"):
+
+            if take() == "+":
+                value += parse_product()
+            else:
+                value -= parse_product()
+
+        return value
+
+    # слагаемое := множитель (*|/ множитель)*
+    def parse_product():
+
+        value = parse_factor()
+
+        while peek() in ("*", "/"):
+
+            if take() == "*":
+                value *= parse_factor()
+
+            else:
+
+                divider = parse_factor()
+
+                if divider == 0:
+                    raise ValueError("деление на ноль")
+
+                value /= divider
+
+        return value
+
+    # множитель := число | (выражение) | -множитель
+    def parse_factor():
+
+        token = peek()
+
+        if token is None:
+            raise ValueError("выражение оборвалось")
+
+        if token in ("+", "-"):
+
+            take()
+
+            value = parse_factor()
+
+            return value if token == "+" else -value
+
+        if token == "(":
+
+            take()
+
+            value = parse_sum()
+
+            if peek() != ")":
+                raise ValueError("нет закрывающей скобки")
+
+            take()
+
+            return value
+
+        if token in (")", "*", "/"):
+            raise ValueError("знак не на своём месте")
+
+        take()
+
+        return Decimal(token)
+
+    try:
+
+        result = parse_sum()
+
+    except (ValueError, InvalidOperation):
+
+        return None
+
+    # Остались лишние символы, например «5)»
+    if position != len(tokens):
+        return None
+
+    return result
+
+
+def is_money_expression(text: str) -> bool:
+    """
+    Пользователь ввёл выражение,
+    а не просто число.
+    """
+
+    return any(
+        sign in clean_money_text(text)[1:]
+        for sign in "+-*/()"
+    )
+
+
+def parse_money(text: str):
+    """
+    Превращает:
+    2500
+    2500.50
+    2500,50
+    99+322
+    3000/4
+
+    в количество копеек.
+    """
+
+    value = calculate_expression(
+        clean_money_text(text)
+    )
+
+    if value is None or value <= 0:
+        return None
+
+    try:
 
         value = value.quantize(
             Decimal("0.01"),
             rounding=ROUND_HALF_UP
         )
 
-        return int(value * 100)
-
     except InvalidOperation:
         return None
+
+    kopecks = int(value * 100)
+
+    if kopecks <= 0 or kopecks > MAX_AMOUNT_KOPECKS:
+        return None
+
+    return kopecks
+
+
+def format_entered_amount(
+    text: str,
+    kopecks: int
+) -> str:
+    """
+    «421 ₽», а для выражения —
+    «421 ₽ (99+322)», чтобы было видно,
+    что именно посчитано.
+    """
+
+    result = f"<b>{format_money(kopecks)}</b>"
+
+    if is_money_expression(text):
+
+        expression = escape(
+            (text or "").strip()
+        )
+
+        result += f" (<code>{expression}</code>)"
+
+    return result
 
 
 def get_members(chat_id: int):
@@ -2031,7 +2221,10 @@ async def choose_payer(
         f"Например:\n"
         f"<code>2500</code>\n"
         f"или\n"
-        f"<code>2500,50</code>",
+        f"<code>2500,50</code>\n\n"
+        f"🧮 Можно сразу посчитать: "
+        f"<code>1200+350</code>, "
+        f"<code>3000/4</code>",
         parse_mode="HTML",
         reply_markup=ForceReply(
             selective=True,
@@ -2064,9 +2257,11 @@ async def enter_amount(
 
         await message.answer(
             "❌ Не получилось распознать сумму.\n\n"
-            "Введите положительное число.\n"
-            "Например: <code>2500</code> "
-            "или <code>2500,50</code>",
+            "Введите положительное число "
+            "или пример, который надо посчитать.\n"
+            "Например: <code>2500</code>, "
+            "<code>2500,50</code> "
+            "или <code>1200+350</code>",
             parse_mode="HTML",
             reply_markup=ForceReply(
                 selective=True
@@ -2085,6 +2280,8 @@ async def enter_amount(
     )
 
     prompt = await message.answer(
+        f"💰 Сумма: "
+        f"{format_entered_amount(message.text, amount_kopecks)}\n\n"
         "👥 <b>Между кем делим расход?</b>\n\n"
         "Нажмите на людей, которые участвовали "
         "в этом расходе.\n\n"
@@ -3396,7 +3593,8 @@ async def expense_edit_amount_handler(
         "💰 <b>Введите новую сумму</b>\n\n"
         f"Сейчас: "
         f"<b>{format_money(current_amount)}</b>\n\n"
-        f"Например: <code>3500</code>",
+        f"Например: <code>3500</code> "
+        f"или <code>3000+500</code>",
         parse_mode="HTML",
         reply_markup=ForceReply(
             selective=True,
@@ -3419,7 +3617,8 @@ async def edit_expense_amount_message(
 
         await message.answer(
             "❌ Введите корректную сумму.\n"
-            "Например: <code>3500</code>",
+            "Например: <code>3500</code> "
+            "или <code>3000+500</code>",
             parse_mode="HTML",
             reply_markup=ForceReply(
                 selective=True
@@ -3465,7 +3664,7 @@ async def edit_expense_amount_message(
     await message.answer(
         "✅ <b>Сумма изменена!</b>\n\n"
         f"Новая сумма: "
-        f"<b>{format_money(amount)}</b>\n\n"
+        f"{format_entered_amount(message.text, amount)}\n\n"
         "📊 Балансы пересчитаны автоматически.",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(
