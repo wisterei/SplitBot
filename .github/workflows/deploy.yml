@@ -36,5 +36,10 @@ jobs:
         run: |
           sleep 10
           docker compose ps
-          docker compose ps --status running --services | grep -qx bot
           docker compose logs --tail=20
+
+          # Контейнер должен работать и не перезапускаться по кругу
+          container_id=$(docker compose ps -q bot)
+          state=$(docker inspect -f '{{.State.Running}} {{.State.Restarting}}' "$container_id")
+          echo "Состояние (работает, перезапускается): $state"
+          test "$state" = "true false"
