@@ -1,0 +1,40 @@
+name: Деплой на сервер
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+  workflow_dispatch:
+
+# Два деплоя одновременно не запускаем
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Раннер на домашнем сервере с меткой splitbot
+    runs-on: [self-hosted, splitbot]
+
+    defaults:
+      run:
+        # Работаем в существующей папке бота: там лежат .env и data/
+        working-directory: /home/wisterei/SplitBot
+
+    steps:
+      - name: Обновить код
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          git log --oneline -1
+
+      - name: Пересобрать и перезапустить бота
+        run: docker compose up -d --build
+
+      - name: Проверить, что бот запустился
+        run: |
+          sleep 10
+          docker compose ps
+          docker compose ps --status running --services | grep -qx bot
+          docker compose logs --tail=20
