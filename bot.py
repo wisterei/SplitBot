@@ -2652,6 +2652,21 @@ async def cancel_expense(
 # 📜 ИСТОРИЯ
 # ============================================================
 
+def get_callback_page(data: str, index: int) -> int:
+    """
+    Номер страницы истории из данных кнопки,
+    например «expense_view:36:2» → 2.
+    Старые кнопки без номера открывают первую страницу.
+    """
+
+    parts = data.split(":")
+
+    try:
+        return max(int(parts[index]), 0)
+    except (IndexError, ValueError):
+        return 0
+
+
 async def show_history_page(
     callback: CallbackQuery,
     group_id: int,
@@ -2788,7 +2803,7 @@ async def show_history_page(
                     ),
                     callback_data=(
                         f"expense_view:"
-                        f"{record['id']}"
+                        f"{record['id']}:{page}"
                     )
                 )
             ])
@@ -2836,7 +2851,7 @@ async def show_history_page(
                     ),
                     callback_data=(
                         f"settlement_view:"
-                        f"{record['id']}"
+                        f"{record['id']}:{page}"
                     )
                 )
             ])
@@ -2911,11 +2926,18 @@ async def show_history_page(
             reply_markup=keyboard
         )
 
-@dp.callback_query(F.data == "history")
+@dp.callback_query(
+    (F.data == "history")
+    | F.data.startswith("history:")
+)
 async def history_handler(
     callback: CallbackQuery,
     group_id: int
 ):
+
+    # «history:3» — вернуться на страницу,
+    # с которой открыли операцию
+    page = get_callback_page(callback.data, 1)
 
     # В личке открываем историю в том же сообщении
     private = is_private(callback.message.chat)
@@ -2930,7 +2952,7 @@ async def history_handler(
     await show_history_page(
         callback,
         group_id,
-        page=0,
+        page=page,
         edit_message=private
     )
 
@@ -3254,6 +3276,9 @@ async def expense_view_handler(
         callback.data.split(":")[1]
     )
 
+    # Страница истории, куда вернёт «К истории»
+    page = get_callback_page(callback.data, 2)
+
     chat_id = group_id
 
     cursor.execute(
@@ -3385,7 +3410,7 @@ async def expense_view_handler(
             [
                 InlineKeyboardButton(
                     text="✏️ Изменить",
-                    callback_data=f"expense_edit:{expense_id}"
+                    callback_data=f"expense_edit:{expense_id}:{page}"
                 )
             ],
             [
@@ -3397,7 +3422,7 @@ async def expense_view_handler(
             [
                 InlineKeyboardButton(
                     text="📜 К истории",
-                    callback_data="history"
+                    callback_data=f"history:{page}"
                 )
             ],
             [
@@ -3433,6 +3458,8 @@ async def expense_edit_handler(
     expense_id = int(
         callback.data.split(":")[1]
     )
+
+    page = get_callback_page(callback.data, 2)
 
     chat_id = group_id
 
@@ -3515,7 +3542,7 @@ async def expense_edit_handler(
                     text="◀️ Назад к расходу",
                     callback_data=(
                         f"expense_view:"
-                        f"{expense_id}"
+                        f"{expense_id}:{page}"
                     )
                 )
             ]
@@ -4285,6 +4312,8 @@ async def settlement_view_handler(
         callback.data.split(":")[1]
     )
 
+    page = get_callback_page(callback.data, 2)
+
     chat_id = group_id
 
     cursor.execute(
@@ -4397,7 +4426,7 @@ async def settlement_view_handler(
             [
                 InlineKeyboardButton(
                     text="📜 К истории",
-                    callback_data="history"
+                    callback_data=f"history:{page}"
                 )
             ],
             [
