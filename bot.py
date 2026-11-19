@@ -125,6 +125,22 @@ CREATE TABLE IF NOT EXISTS user_active_group (
 )
 """)
 
+# Склад: покупки, которые ещё не разделили.
+# В балансах не участвуют, пока из них
+# не сделают обычный расход.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS stash_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    local_number INTEGER NOT NULL,
+    paid_by INTEGER NOT NULL,
+    amount_kopecks INTEGER NOT NULL,
+    comment TEXT,
+    created_by INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
 # Если база была создана раньше,
 # добавляем поле created_by автоматически.
 
@@ -1614,6 +1630,10 @@ def get_main_keyboard(private: bool = False):
                 InlineKeyboardButton(
                     text="📈 Статистика",
                     callback_data="statistics"
+                ),
+                InlineKeyboardButton(
+                    text="📦 Склад",
+                    callback_data="stash"
                 )
             ],
             [
@@ -2275,6 +2295,35 @@ async def enter_amount(
         selected_users=[]
     )
 
+    data = await state.get_data()
+
+    # На склад кладём без участников:
+    # делить будем потом
+    if data.get("stash"):
+
+        await state.set_state(
+            ExpenseForm.entering_comment
+        )
+
+        prompt = await message.answer(
+            f"💰 Сумма: "
+            f"{format_entered_amount(message.text, amount_kopecks)}\n\n"
+            "📦 <b>Что кладём на склад?</b>\n\n"
+            "Например: <code>Продукты на неделю</code>",
+            parse_mode="HTML",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Например: Продукты"
+            )
+        )
+
+        await remember_flow_message(
+            state,
+            prompt
+        )
+
+        return
+
     await state.set_state(
         ExpenseForm.choosing_participants
     )
@@ -2430,6 +2479,18 @@ async def participants_done(
 
         return
 
+    # Делим предмет со склада: название уже есть
+    if data.get("stash_item_id"):
+
+        await finish_stash_split(
+            callback,
+            state,
+            data,
+            selected_users
+        )
+
+        return
+
     await state.set_state(
         ExpenseForm.entering_comment
     )
@@ -2459,26 +2520,20 @@ async def participants_done(
 # КОММЕНТАРИЙ + СОХРАНЕНИЕ
 # ============================================================
 
-@dp.message(ExpenseForm.entering_comment)
-async def enter_comment(
-    message: Message,
-    state: FSMContext
+def save_expense(
+    chat_id: int,
+    payer_id: int,
+    amount_kopecks: int,
+    comment: str,
+    selected_users: list,
+    created_by: int
 ):
+    """
+    Записывает расход и доли участников.
+    db.commit() делает вызывающий код.
 
-    comment = (
-        message.text or ""
-    ).strip()
-
-    if comment == "-":
-        comment = ""
-
-    data = await state.get_data()
-
-    chat_id = data["chat_id"]
-    payer_id = data["payer_id"]
-    payer_name = data["payer_name"]
-    amount_kopecks = data["amount_kopecks"]
-    selected_users = data["selected_users"]
+    Возвращает список (user_id, доля).
+    """
 
     # ------------------------------------
     # Распределяем сумму без ошибок округления
@@ -2503,8 +2558,8 @@ async def enter_comment(
     # ------------------------------------
     expense_number = get_next_expense_number(
         chat_id
-    )   
-    
+    )
+
     cursor.execute(
         """
         INSERT INTO expenses
@@ -2524,7 +2579,7 @@ async def enter_comment(
             payer_id,
             amount_kopecks,
             comment,
-            message.from_user.id
+            created_by
         )
     )
 
@@ -2568,11 +2623,17 @@ async def enter_comment(
             (user_id, share)
         )
 
-    db.commit()
+    return participant_rows
 
-    # ------------------------------------
-    # Формируем красивый ответ
-    # ------------------------------------
+
+def format_saved_expense(
+    header: str,
+    chat_id: int,
+    comment: str,
+    amount_kopecks: int,
+    payer_name: str,
+    participant_rows: list
+) -> str:
 
     if comment:
         title = escape(comment)
@@ -2580,7 +2641,7 @@ async def enter_comment(
         title = "Без комментария"
 
     text = (
-        "✅ <b>Расход сохранён!</b>\n\n"
+        f"{header}\n\n"
         f"📝 <b>{title}</b>\n"
         f"💰 Сумма: "
         f"<b>{format_money(amount_kopecks)}</b>\n"
@@ -2601,6 +2662,61 @@ async def enter_comment(
             f"{format_money(share)}\n"
         )
 
+    return text
+
+
+@dp.message(ExpenseForm.entering_comment)
+async def enter_comment(
+    message: Message,
+    state: FSMContext
+):
+
+    comment = (
+        message.text or ""
+    ).strip()
+
+    if comment == "-":
+        comment = ""
+
+    data = await state.get_data()
+
+    # Покупка на склад: без участников
+    if data.get("stash"):
+
+        await save_stash_item(
+            message,
+            state,
+            comment
+        )
+
+        return
+
+    chat_id = data["chat_id"]
+    payer_id = data["payer_id"]
+    payer_name = data["payer_name"]
+    amount_kopecks = data["amount_kopecks"]
+    selected_users = data["selected_users"]
+
+    participant_rows = save_expense(
+        chat_id,
+        payer_id,
+        amount_kopecks,
+        comment,
+        selected_users,
+        message.from_user.id
+    )
+
+    db.commit()
+
+    text = format_saved_expense(
+        "✅ <b>Расход сохранён!</b>",
+        chat_id,
+        comment,
+        amount_kopecks,
+        payer_name,
+        participant_rows
+    )
+
     # Сообщения удаляем в том чате, где шёл диалог:
     # в личке он не совпадает с группой расхода.
     await cleanup_flow_messages(
@@ -2619,7 +2735,7 @@ async def enter_comment(
         )
     )
 
-    
+
 
 
 # ============================================================
@@ -2631,7 +2747,19 @@ async def cancel_expense(
     callback: CallbackQuery,
     state: FSMContext
 ):
-    
+
+    data = await state.get_data()
+
+    if data.get("stash_item_id"):
+        text = (
+            "❌ <b>Отменено.</b>\n\n"
+            "Предмет остался на складе."
+        )
+    elif data.get("stash"):
+        text = "❌ <b>Добавление на склад отменено.</b>"
+    else:
+        text = "❌ <b>Добавление расхода отменено.</b>"
+
     await cleanup_flow_messages(
         callback.message.chat.id,
         state
@@ -2641,8 +2769,639 @@ async def cancel_expense(
 
     await replace_screen(
         callback,
-        "❌ <b>Добавление расхода отменено.</b>",
+        text,
         reply_markup=get_back_to_main_keyboard()
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# 📦 СКЛАД
+# ============================================================
+#
+# Покупки, которые ещё не разделили.
+# Хранятся в stash_items и не попадают в балансы.
+# «Разделить» превращает предмет в обычный расход.
+
+def get_stash_item(chat_id: int, item_id: int):
+
+    cursor.execute(
+        """
+        SELECT
+            local_number,
+            paid_by,
+            amount_kopecks,
+            comment,
+            created_by,
+            created_at
+        FROM stash_items
+        WHERE id = ?
+        AND chat_id = ?
+        """,
+        (
+            item_id,
+            chat_id
+        )
+    )
+
+    return cursor.fetchone()
+
+
+def get_stash_keyboard_footer():
+
+    return [
+        [
+            InlineKeyboardButton(
+                text="📦 К складу",
+                callback_data="stash"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🏠 Главное меню",
+                callback_data="main_menu"
+            )
+        ]
+    ]
+
+
+async def save_stash_item(
+    message: Message,
+    state: FSMContext,
+    comment: str
+):
+
+    data = await state.get_data()
+
+    chat_id = data["chat_id"]
+
+    cursor.execute(
+        """
+        SELECT COALESCE(MAX(local_number), 0) + 1
+        FROM stash_items
+        WHERE chat_id = ?
+        """,
+        (chat_id,)
+    )
+
+    item_number = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        INSERT INTO stash_items
+        (
+            chat_id,
+            local_number,
+            paid_by,
+            amount_kopecks,
+            comment,
+            created_by
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            chat_id,
+            item_number,
+            data["payer_id"],
+            data["amount_kopecks"],
+            comment,
+            message.from_user.id
+        )
+    )
+
+    db.commit()
+
+    if comment:
+        title = escape(comment)
+    else:
+        title = "Без названия"
+
+    await cleanup_flow_messages(
+        message.chat.id,
+        state
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "📦 <b>Добавлено на склад!</b>\n\n"
+        f"📝 <b>{title}</b>\n"
+        f"💰 Сумма: "
+        f"<b>{format_money(data['amount_kopecks'])}</b>\n"
+        f"💳 Заплатил: "
+        f"<b>{escape(data['payer_name'])}</b>\n\n"
+        "В балансах не учитывается, "
+        "пока вы его не разделите.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=get_stash_keyboard_footer()
+        )
+    )
+
+
+@dp.callback_query(F.data == "stash")
+async def stash_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    group_id: int
+):
+
+    await state.clear()
+
+    cursor.execute(
+        """
+        SELECT
+            id,
+            local_number,
+            paid_by,
+            amount_kopecks,
+            comment
+        FROM stash_items
+        WHERE chat_id = ?
+        ORDER BY local_number
+        """,
+        (group_id,)
+    )
+
+    items = cursor.fetchall()
+
+    keyboard_rows = []
+
+    if not items:
+
+        text = (
+            "📦 <b>Склад пуст</b>\n\n"
+            "Сюда можно положить покупку, "
+            "которую пока не нужно делить: "
+            "она не попадёт в балансы, "
+            "а разделить её можно позже."
+        )
+
+    else:
+
+        total = sum(
+            item[3]
+            for item in items
+        )
+
+        text = (
+            "📦 <b>Склад</b>\n"
+            f"Предметов: <b>{len(items)}</b> "
+            f"на <b>{format_money(total)}</b>\n\n"
+            "В балансах не учитываются, "
+            "пока их не разделят.\n\n"
+        )
+
+        for (
+            item_id,
+            local_number,
+            paid_by,
+            amount,
+            comment
+        ) in items:
+
+            title = comment or "Без названия"
+
+            payer_name = get_member_name(
+                group_id,
+                paid_by
+            )
+
+            text += (
+                f"📦 <b>#{local_number} — "
+                f"{escape(title)}</b>\n"
+                f"💰 {format_money(amount)} · "
+                f"💳 {escape(payer_name)}\n\n"
+            )
+
+            button_title = title
+
+            if len(button_title) > 24:
+                button_title = (
+                    button_title[:24] + "…"
+                )
+
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    text=(
+                        f"📦 #{local_number} "
+                        f"{button_title}"
+                    ),
+                    callback_data=f"stash_view:{item_id}"
+                )
+            ])
+
+    keyboard_rows.append([
+        InlineKeyboardButton(
+            text="➕ Добавить на склад",
+            callback_data="stash_add"
+        )
+    ])
+
+    keyboard_rows.append([
+        InlineKeyboardButton(
+            text="🏠 Главное меню",
+            callback_data="main_menu"
+        )
+    ])
+
+    await replace_screen(
+        callback,
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=keyboard_rows
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stash_add")
+async def stash_add_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    group_id: int
+):
+
+    if not get_members(group_id):
+
+        await callback.answer(
+            "Сначала добавьте участников.",
+            show_alert=True
+        )
+
+        return
+
+    await state.clear()
+
+    await state.set_state(
+        ExpenseForm.choosing_payer
+    )
+
+    screen = await replace_screen(
+        callback,
+        "📦 <b>Добавление на склад</b>\n\n"
+        "💳 <b>Кто заплатил?</b>",
+        reply_markup=get_payer_keyboard(group_id)
+    )
+
+    await state.update_data(
+        stash=True,
+        flow_bot_message_ids=[
+            screen.message_id
+        ]
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("stash_view:")
+)
+async def stash_view_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    group_id: int
+):
+
+    await state.clear()
+
+    item_id = int(
+        callback.data.split(":")[1]
+    )
+
+    item = get_stash_item(group_id, item_id)
+
+    if not item:
+
+        await callback.answer(
+            "Этого предмета уже нет на складе.",
+            show_alert=True
+        )
+
+        return
+
+    (
+        local_number,
+        paid_by,
+        amount,
+        comment,
+        created_by,
+        created_at
+    ) = item
+
+    title = comment or "Без названия"
+
+    payer_name = get_member_name(group_id, paid_by)
+    creator_name = get_member_name(group_id, created_by)
+
+    text = (
+        f"📦 <b>Склад #{local_number}</b>\n\n"
+        f"📝 {escape(title)}\n"
+        f"💰 Сумма: "
+        f"<b>{format_money(amount)}</b>\n"
+        f"💳 Заплатил: "
+        f"<b>{escape(payer_name)}</b>\n"
+        f"🕒 Добавлен: "
+        f"{format_datetime(created_at)}\n"
+        f"✍️ Внёс: "
+        f"{escape(creator_name)}\n\n"
+        "Пока предмет на складе, "
+        "он не влияет на балансы."
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👥 Разделить",
+                    callback_data=f"stash_split:{item_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"stash_delete:{item_id}"
+                )
+            ],
+            *get_stash_keyboard_footer()
+        ]
+    )
+
+    await replace_screen(
+        callback,
+        text,
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("stash_split:")
+)
+async def stash_split_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    group_id: int
+):
+
+    item_id = int(
+        callback.data.split(":")[1]
+    )
+
+    item = get_stash_item(group_id, item_id)
+
+    if not item:
+
+        await callback.answer(
+            "Этого предмета уже нет на складе.",
+            show_alert=True
+        )
+
+        return
+
+    (
+        local_number,
+        paid_by,
+        amount,
+        comment,
+        created_by,
+        created_at
+    ) = item
+
+    title = comment or "Без названия"
+
+    payer_name = get_member_name(group_id, paid_by)
+
+    await state.clear()
+
+    # Дальше работают обычные обработчики
+    # выбора участников расхода
+    await state.set_state(
+        ExpenseForm.choosing_participants
+    )
+
+    screen = await replace_screen(
+        callback,
+        f"👥 <b>Между кем делим "
+        f"«{escape(title)}»?</b>\n\n"
+        f"💰 {format_money(amount)} · "
+        f"💳 {escape(payer_name)}\n\n"
+        "✅ — выбран\n"
+        "⬜ — не выбран",
+        reply_markup=get_participants_keyboard(
+            group_id,
+            []
+        )
+    )
+
+    await state.update_data(
+        stash_item_id=item_id,
+        chat_id=group_id,
+        payer_id=paid_by,
+        payer_name=payer_name,
+        amount_kopecks=amount,
+        comment=comment or "",
+        selected_users=[],
+        flow_bot_message_ids=[
+            screen.message_id
+        ]
+    )
+
+    await callback.answer()
+
+
+async def finish_stash_split(
+    callback: CallbackQuery,
+    state: FSMContext,
+    data: dict,
+    selected_users: list
+):
+    """
+    Превращает предмет со склада в обычный расход.
+    """
+
+    chat_id = data["chat_id"]
+
+    # Сначала убираем предмет со склада: если двое
+    # нажали «Разделить» одновременно, расход
+    # создаст только тот, кто успел первым.
+    cursor.execute(
+        """
+        DELETE FROM stash_items
+        WHERE id = ?
+        AND chat_id = ?
+        """,
+        (
+            data["stash_item_id"],
+            chat_id
+        )
+    )
+
+    if cursor.rowcount == 0:
+
+        db.rollback()
+
+        await callback.answer(
+            "Этот предмет уже разделили или удалили.",
+            show_alert=True
+        )
+
+        await cleanup_flow_messages(
+            callback.message.chat.id,
+            state
+        )
+
+        await state.clear()
+
+        return
+
+    participant_rows = save_expense(
+        chat_id,
+        data["payer_id"],
+        data["amount_kopecks"],
+        data["comment"],
+        selected_users,
+        callback.from_user.id
+    )
+
+    db.commit()
+
+    text = format_saved_expense(
+        "✅ <b>Разделено со склада!</b>",
+        chat_id,
+        data["comment"],
+        data["amount_kopecks"],
+        data["payer_name"],
+        participant_rows
+    )
+
+    text += (
+        "\n📊 Теперь это обычный расход, "
+        "балансы пересчитаны."
+    )
+
+    await cleanup_flow_messages(
+        callback.message.chat.id,
+        state
+    )
+
+    await state.clear()
+
+    await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(
+            is_private(callback.message.chat)
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("stash_delete:")
+)
+async def stash_delete_handler(
+    callback: CallbackQuery,
+    group_id: int
+):
+
+    item_id = int(
+        callback.data.split(":")[1]
+    )
+
+    item = get_stash_item(group_id, item_id)
+
+    if not item:
+
+        await callback.answer(
+            "Этого предмета уже нет на складе.",
+            show_alert=True
+        )
+
+        return
+
+    local_number, paid_by, amount, comment = item[:4]
+
+    title = comment or "Без названия"
+
+    await replace_screen(
+        callback,
+        "⚠️ <b>Удалить со склада?</b>\n\n"
+        f"📦 #{local_number} — {escape(title)}\n"
+        f"💰 {format_money(amount)}\n\n"
+        "Предмет пропадёт совсем: "
+        "в балансах его и так нет.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да, удалить",
+                        callback_data=(
+                            f"stash_delete_confirm:"
+                            f"{item_id}"
+                        )
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data=f"stash_view:{item_id}"
+                    )
+                ]
+            ]
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data.startswith("stash_delete_confirm:")
+)
+async def stash_delete_confirm_handler(
+    callback: CallbackQuery,
+    group_id: int
+):
+
+    item_id = int(
+        callback.data.split(":")[1]
+    )
+
+    cursor.execute(
+        """
+        DELETE FROM stash_items
+        WHERE id = ?
+        AND chat_id = ?
+        """,
+        (
+            item_id,
+            group_id
+        )
+    )
+
+    deleted = cursor.rowcount
+
+    db.commit()
+
+    if deleted == 0:
+
+        await callback.answer(
+            "Этого предмета уже нет на складе.",
+            show_alert=True
+        )
+
+        return
+
+    await replace_screen(
+        callback,
+        "🗑 <b>Предмет удалён со склада.</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=get_stash_keyboard_footer()
+        )
     )
 
     await callback.answer()
